@@ -2,6 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    embed_windows_icon();
+
     let manifest = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
     let kernel_root = manifest.join("kernels").join("src");
     rerun_tree(&kernel_root);
@@ -44,6 +46,17 @@ fn main() {
     }
 
     println!("cargo:rustc-env=DUBFOCUS_PTX={}", ptx_path.display());
+}
+
+fn embed_windows_icon() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "windows" {
+        return;
+    }
+    println!("cargo:rerun-if-changed=images/dubFocus.ico");
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("images/dubFocus.ico");
+    res.compile().expect("intégration de images/dubFocus.ico dans l'exécutable");
 }
 
 fn rerun_tree(dir: &Path) {

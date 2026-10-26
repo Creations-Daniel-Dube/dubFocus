@@ -596,12 +596,25 @@ impl eframe::App for App {
     }
 }
 
+fn app_icon() -> egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../images/dubFocus.png"))
+        .expect("images/dubFocus.png")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([980.0, 640.0])
-            .with_title("dubFocus"),
+            .with_title("dubFocus")
+            .with_icon(app_icon()),
         centered: true,
         ..Default::default()
     };
