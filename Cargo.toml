@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [".", "kernels"]
+
+[package]
+name = "dubFocus"
+version = "0.1.5"
+edition = "2024"
+description = "Raffinement GPU de la mise au point pour images astronomiques"
+publish = false
+
+[dependencies]
+dubfocus-kernels = { path = "kernels" }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12000", "cufft"] }
+eframe = "0.37"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiff = "0.11"
