@@ -4,7 +4,7 @@ members = [".", "kernels"]
 
 [package]
 name = "dubFocus"
-version = "0.1.10"
+version = "0.1.15"
 edition = "2024"
 description = "Raffinement GPU de la mise au point pour images astronomiques"
 publish = false
