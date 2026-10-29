@@ -1,5 +1,7 @@
 # dubFocus
 
+> Application du catalogue dubSuite. Installation, mises à jour et désinstallation : [dubSuite](https://github.com/Creations-Daniel-Dube/dubSuite).
+
 dubFocus raffine la mise au point d’images astronomiques. Il estime le flou — disque de défocalisation ou gaussienne — puis le retire sur un GPU NVIDIA, pour redonner du contraste aux étoiles et aux détails fins.
 
 Le calcul porte sur la luminance. La couleur d’origine est réappliquée ensuite, ce qui évite les franges colorées qu’une déconvolution canal par canal produit souvent sur le ciel.
