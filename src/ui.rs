@@ -6,7 +6,7 @@ use eframe::egui::{
 use rfd::FileDialog;
 
 use crate::deconv::{Engine, ExportRequest, Msg, ProcessParams, ShadeRequest};
-use crate::gpu::probe_gpu;
+use crate::gpu::{kernel_arch, probe_gpu, unsupported_message};
 use crate::io::SaveKind;
 use crate::psf::PsfKind;
 use crate::settings::Settings;
@@ -39,6 +39,7 @@ pub struct App {
     settings: Settings,
     engine: Option<Engine>,
     gpu_line: String,
+    warn_text: String,
     warn_open: bool,
     error: Option<String>,
     path: String,
@@ -71,12 +72,22 @@ impl App {
         install_font(&cc.egui_ctx);
         let settings = Settings::load();
         let gpu = probe_gpu();
-        let warn_open = gpu.is_err();
-        let gpu_line = match &gpu {
-            Ok((name, gib)) => format!("GPU : {name} · {gib} Gio"),
-            Err(err) => format!("GPU indisponible : {err}"),
+        let (gpu_line, warn_text, start_engine) = match &gpu {
+            Ok(info) => {
+                let line = format!("GPU : {}", info.summary());
+                match kernel_arch(info.major, info.minor) {
+                    Some(_) => (line, String::new(), true),
+                    None => (line, unsupported_message(info.major, info.minor), false),
+                }
+            }
+            Err(err) => (
+                format!("GPU indisponible : {err}"),
+                "dubFocus a besoin d'un GPU NVIDIA et du pilote CUDA.".to_string(),
+                false,
+            ),
         };
-        let engine = if gpu.is_ok() { Some(Engine::spawn()) } else { None };
+        let warn_open = !start_engine;
+        let engine = if start_engine { Some(Engine::spawn()) } else { None };
         let params = ProcessParams {
             kind: settings.kind(),
             radius: settings.radius.clamp(0.3, 8.0),
@@ -95,6 +106,7 @@ impl App {
             settings,
             engine,
             gpu_line,
+            warn_text,
             warn_open,
             error: None,
             path: String::new(),
@@ -547,7 +559,9 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label("dubFocus a besoin d'un GPU NVIDIA et du pilote CUDA.");
+                    if !self.warn_text.is_empty() {
+                        ui.label(&self.warn_text);
+                    }
                     ui.label(&self.gpu_line);
                     if ui.button("OK").clicked() {
                         open = false;

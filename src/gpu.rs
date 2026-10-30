@@ -24,15 +24,85 @@ macro_rules! klaunch {
     }};
 }
 
-pub fn probe_gpu() -> Result<(String, String), String> {
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    pub name: String,
+    pub total: usize,
+    pub free: usize,
+    pub major: i32,
+    pub minor: i32,
+}
+
+impl GpuInfo {
+    pub fn summary(&self) -> String {
+        let arch = kernel_arch(self.major, self.minor).unwrap_or("non pris en charge");
+        format!(
+            "{} · compute {}.{} · {arch} · {:.1} Gio",
+            self.name,
+            self.major,
+            self.minor,
+            self.total as f64 / 1024.0 / 1024.0 / 1024.0
+        )
+    }
+}
+
+/// `sm_61` pour la GTX 1060 (6.1 et 6.2), `sm_70` à partir de compute 7.0.
+/// La RTX 2060 est en 7.5 et la RTX 3060 en 8.6 : les deux restent sur `sm_70`.
+pub fn kernel_arch(major: i32, minor: i32) -> Option<&'static str> {
+    if (major, minor) >= (7, 0) {
+        Some("sm_70")
+    } else if (major, minor) >= (6, 1) {
+        Some("sm_61")
+    } else {
+        None
+    }
+}
+
+pub fn unsupported_message(major: i32, minor: i32) -> String {
+    format!(
+        "Carte non prise en charge (compute {major}.{minor}). dubFocus exige une GTX 1060 (6.1) ou une carte plus récente."
+    )
+}
+
+pub fn probe_document(info: &GpuInfo) -> String {
+    let kernels = kernel_arch(info.major, info.minor).unwrap_or("unsupported");
+    format!(
+        "{{\"ev\":\"probe\",\"name\":\"{}\",\"total\":{},\"free\":{},\"major\":{},\"minor\":{},\"kernels\":\"{kernels}\"}}",
+        info.name.replace('"', "'"),
+        info.total,
+        info.free,
+        info.major,
+        info.minor
+    )
+}
+
+fn ptx_for(arch: &str) -> Result<&'static str, Error> {
+    let _stamp = env!("DUBFOCUS_PTX_STAMP");
+    let _stamp_pascal = env!("DUBFOCUS_PTX_SM61_STAMP");
+    match arch {
+        "sm_70" => Ok(include_str!(env!("DUBFOCUS_PTX"))),
+        "sm_61" => Ok(include_str!(env!("DUBFOCUS_PTX_SM61"))),
+        _ => Err(Error::new(format!("module PTX inconnu : {arch}"))),
+    }
+}
+
+pub fn probe_gpu() -> Result<GpuInfo, String> {
     let ctx = CudaContext::new(0).map_err(|err| err.to_string())?;
+    device_info(&ctx)
+}
+
+fn device_info(ctx: &CudaContext) -> Result<GpuInfo, String> {
     let name = ctx.name().map_err(|err| err.to_string())?;
-    let bytes = ctx.total_mem().map_err(|err| err.to_string())?;
-    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    Ok((name, format!("{gib:.1}")))
+    let total = ctx.total_mem().map_err(|err| err.to_string())?;
+    let (free, _) = ctx.mem_get_info().map_err(|err| err.to_string())?;
+    let (major, minor) = ctx.compute_capability().map_err(|err| err.to_string())?;
+    Ok(GpuInfo { name, total, free, major, minor })
 }
 
 struct Gpu {
+    /// Module réellement chargé : `sm_70` ou `sm_61`.
+    #[allow(dead_code)]
+    arch: &'static str,
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     copy_f32: CudaFunction,
@@ -56,11 +126,30 @@ struct Gpu {
 impl Gpu {
     fn new() -> Result<Self, Error> {
         let ctx = CudaContext::new(0).map_err(gpu_err)?;
+        let (major, minor) = ctx.compute_capability().map_err(gpu_err)?;
+        let arch = kernel_arch(major, minor).ok_or_else(|| Error::new(unsupported_message(major, minor)))?;
+        Self::load(ctx, arch)
+    }
+
+    /// Charge un module précis. La compute capability est lue avant `load_module`.
+    /// Une carte récente peut exécuter le PTX `sm_61` ; le démarrage normal ne le fait pas.
+    #[cfg(test)]
+    fn load_arch(arch: &'static str) -> Result<Self, Error> {
+        let ctx = CudaContext::new(0).map_err(gpu_err)?;
+        let (major, minor) = ctx.compute_capability().map_err(gpu_err)?;
+        if (major, minor) < (6, 1) {
+            return Err(Error::new(unsupported_message(major, minor)));
+        }
+        Self::load(ctx, arch)
+    }
+
+    fn load(ctx: Arc<CudaContext>, arch: &'static str) -> Result<Self, Error> {
+        let ptx = ptx_for(arch)?;
         let stream = ctx.default_stream();
-        let ptx = Ptx::from_src(include_str!(env!("DUBFOCUS_PTX")));
-        let module = ctx.load_module(ptx).map_err(gpu_err)?;
+        let module = ctx.load_module(Ptx::from_src(ptx)).map_err(|err| module_err(err, arch))?;
         let load = |name: &str| module.load_function(name).map_err(|err| Error::new(format!("noyau {name} : {err}")));
         Ok(Self {
+            arch,
             stream,
             copy_f32: load("copy_f32")?,
             scale_relu: load("scale_relu")?,
@@ -146,8 +235,22 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Result<Self, Error> {
+        Self::create(Gpu::new()?)
+    }
+
+    #[cfg(test)]
+    pub fn arch(&self) -> &'static str {
+        self.gpu.arch
+    }
+
+    #[cfg(test)]
+    pub fn new_with_arch(arch: &'static str) -> Result<Self, Error> {
+        Self::create(Gpu::load_arch(arch)?)
+    }
+
+    fn create(gpu: Gpu) -> Result<Self, Error> {
         Ok(Self {
-            gpu: Gpu::new()?,
+            gpu,
             picture: None,
             spectrum: None,
             shade: None,
@@ -584,6 +687,18 @@ fn gpu_err(err: impl ToString) -> Error {
     Error::new(format!("CUDA : {}", err.to_string()))
 }
 
+/// Une 1060 a besoin d'un pilote de la branche 580, le dernier qui expose CUDA 12 pour Pascal.
+fn module_err(err: impl ToString, arch: &str) -> Error {
+    let text = gpu_err(err);
+    if arch == "sm_61" {
+        Error::new(format!(
+            "{text}. Une GTX 1060 a besoin d'un pilote de la branche 580, le dernier qui expose CUDA 12 pour Pascal."
+        ))
+    } else {
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,14 +706,92 @@ mod tests {
     use crate::reference::{blur, contrast};
 
     #[test]
-    fn gpu_restores_a_blurred_edge() {
-        let mut session = match Session::new() {
+    fn kernel_arch_splits_pascal_and_turing() {
+        assert_eq!(kernel_arch(6, 0), None);
+        assert_eq!(kernel_arch(6, 1), Some("sm_61"));
+        assert_eq!(kernel_arch(6, 2), Some("sm_61"));
+        assert_eq!(kernel_arch(7, 0), Some("sm_70"));
+        assert_eq!(kernel_arch(7, 5), Some("sm_70"));
+        assert_eq!(kernel_arch(8, 6), Some("sm_70"));
+    }
+
+    #[test]
+    fn embedded_ptx_has_no_unresolved_extern() {
+        for ptx in [include_str!(env!("DUBFOCUS_PTX")), include_str!(env!("DUBFOCUS_PTX_SM61"))] {
+            assert!(!ptx.contains(".extern .func"), "{ptx}");
+        }
+        assert!(include_str!(env!("DUBFOCUS_PTX")).contains(".target sm_70"));
+        assert!(!include_str!(env!("DUBFOCUS_PTX")).contains(".target sm_61"));
+        assert!(include_str!(env!("DUBFOCUS_PTX_SM61")).contains(".target sm_61"));
+        assert!(include_str!(env!("DUBFOCUS_PTX_SM61")).contains(".version 5.0"));
+    }
+
+    #[test]
+    fn probe_document_lists_arch() {
+        let pascal = GpuInfo { name: "GTX 1060".into(), total: 6 * 1024 * 1024 * 1024, free: 1024, major: 6, minor: 1 };
+        let value: serde_json::Value = serde_json::from_str(&probe_document(&pascal)).unwrap();
+        assert_eq!(value["major"], 6);
+        assert_eq!(value["minor"], 1);
+        assert_eq!(value["kernels"], "sm_61");
+        assert_eq!(pascal.summary(), "GTX 1060 · compute 6.1 · sm_61 · 6.0 Gio");
+        let recent = GpuInfo { name: "RTX 3060".into(), major: 8, minor: 6, ..pascal };
+        let value: serde_json::Value = serde_json::from_str(&probe_document(&recent)).unwrap();
+        assert_eq!(value["major"], 8);
+        assert_eq!(value["minor"], 6);
+        assert_eq!(value["kernels"], "sm_70");
+        let old = GpuInfo { major: 5, minor: 2, ..pascal };
+        let value: serde_json::Value = serde_json::from_str(&probe_document(&old)).unwrap();
+        assert_eq!(value["kernels"], "unsupported");
+    }
+
+    #[test]
+    fn recent_gpu_loads_sm70() {
+        let info = match probe_gpu() {
+            Ok(info) => info,
+            Err(err) => {
+                eprintln!("GPU ignoré : {err}");
+                return;
+            }
+        };
+        let session = match Session::new() {
             Ok(session) => session,
             Err(err) => {
                 eprintln!("GPU ignoré : {err}");
                 return;
             }
         };
+        if (info.major, info.minor) >= (7, 0) {
+            assert_eq!(kernel_arch(info.major, info.minor), Some("sm_70"));
+            assert_eq!(session.arch(), "sm_70");
+        }
+    }
+
+    #[test]
+    fn gpu_restores_a_blurred_edge() {
+        let session = match Session::new() {
+            Ok(session) => session,
+            Err(err) => {
+                eprintln!("GPU ignoré : {err}");
+                return;
+            }
+        };
+        restores_blurred_edge(session);
+    }
+
+    #[test]
+    fn pascal_module_launches_on_newer_gpu() {
+        let session = match Session::new_with_arch("sm_61") {
+            Ok(session) => session,
+            Err(err) => {
+                eprintln!("GPU ignoré : {err}");
+                return;
+            }
+        };
+        assert_eq!(session.arch(), "sm_61");
+        restores_blurred_edge(session);
+    }
+
+    fn restores_blurred_edge(mut session: Session) {
         let width = 64usize;
         let height = 48usize;
         let mut sharp = vec![0.2f32; width * height];
