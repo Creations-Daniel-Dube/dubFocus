@@ -656,7 +656,7 @@ pub fn run() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([980.0, 640.0])
-            .with_title("dubFocus")
+            .with_title(format!("dubFocus    v{}", env!("CARGO_PKG_VERSION")))
             .with_icon(app_icon()),
         centered: true,
         ..Default::default()
