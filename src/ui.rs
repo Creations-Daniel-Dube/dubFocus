@@ -252,7 +252,29 @@ impl App {
         let Some(engine) = &self.engine else { return };
         while let Some(msg) = engine.poll() {
             match msg {
-                Msg::Ready { ticket, width, height, channels, bit_depth, millis, preview, refined, treat_srgb } => {
+                Msg::Decoded { ticket, width, height, channels, bit_depth, treat_srgb, view_w, view_h, pixels } => {
+                    if ticket != self.ticket && ticket != 0 {
+                        continue;
+                    }
+                    if pixels.len() != view_w as usize * view_h as usize * 4 {
+                        continue;
+                    }
+                    self.meta = Some(Meta { width, height, channels, bit_depth });
+                    self.params.treat_srgb = treat_srgb;
+                    self.status = "Image lue.".to_string();
+                    let image = ColorImage::from_rgba_unmultiplied([view_w as usize, view_h as usize], &pixels);
+                    if let Some(texture) = &mut self.texture {
+                        texture.set(image, TextureOptions::LINEAR);
+                    } else {
+                        self.texture = Some(ctx.load_texture("vue", image, TextureOptions::LINEAR));
+                    }
+                }
+                Msg::Status { ticket, text } => {
+                    if ticket == self.ticket {
+                        self.status = text;
+                    }
+                }
+                Msg::Ready { ticket, width, height, channels, bit_depth, millis, preview, memory_limited, refined, treat_srgb } => {
                     if ticket != self.ticket && ticket != 0 {
                         continue;
                     }
@@ -262,7 +284,13 @@ impl App {
                     self.progress = 0.0;
                     self.refined = refined;
                     self.shade_dirty = true;
-                    self.status = if refined && preview {
+                    self.status = if memory_limited {
+                        if millis == 0 {
+                            "Aperçu réduit (mémoire GPU).".to_string()
+                        } else {
+                            format!("Aperçu réduit (mémoire GPU) · Richardson-Lucy · {} it · {millis} ms", self.params.iterations)
+                        }
+                    } else if refined && preview {
                         format!("Aperçu réduit · Richardson-Lucy · {} it · {millis} ms", self.params.iterations)
                     } else if refined {
                         format!("Richardson-Lucy · {} itérations · {millis} ms", self.params.iterations)
@@ -305,6 +333,7 @@ impl App {
                     if ticket == 0 || ticket == self.ticket {
                         self.busy = false;
                         self.shade_pending = false;
+                        self.shade_dirty = false;
                         self.progress = 0.0;
                         self.status = "Échec du traitement.".to_string();
                         self.error = Some(message);
@@ -704,8 +733,9 @@ fn ensure_extension(path: PathBuf, extension: &str) -> PathBuf {
     }
 }
 
-/// Place la texture à sa taille native, centrée. Le zoom reste uniforme :
-/// un changement de fenêtre n'étire pas les pixels en attendant le nouveau rendu.
+/// Place la texture à sa taille native, centrée. Une texture plus grande que la vue
+/// est réduite en gardant le ratio. Le zoom reste uniforme : un changement de
+/// fenêtre n'étire pas les pixels en attendant le nouveau rendu.
 fn preview_dest(area: Rect, tex_w: i32, tex_h: i32, ppp: f32) -> Rect {
     if tex_w <= 0 || tex_h <= 0 || ppp <= 0.0 {
         return area;
@@ -713,8 +743,11 @@ fn preview_dest(area: Rect, tex_w: i32, tex_h: i32, ppp: f32) -> Rect {
     let size = vec2(tex_w as f32 / ppp, tex_h as f32 / ppp);
     if (size.x - area.width()).abs() <= 0.5 && (size.y - area.height()).abs() <= 0.5 {
         area
-    } else {
+    } else if size.x <= area.width() + 0.5 && size.y <= area.height() + 0.5 {
         Rect::from_center_size(area.center(), size)
+    } else {
+        let fit = (area.width() / size.x).min(area.height() / size.y);
+        Rect::from_center_size(area.center(), size * fit)
     }
 }
 
@@ -744,5 +777,14 @@ mod tests {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 200.0));
         let dest = preview_dest(area, 100, 200, 1.0);
         assert!((dest.width() / dest.height() - 0.5).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn preview_reduit_une_texture_plus_grande_que_la_vue() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0));
+        let dest = preview_dest(area, 2000, 1000, 1.0);
+        assert!(dest.width() <= area.width() + 0.5);
+        assert!(dest.height() <= area.height() + 0.5);
+        assert!((dest.width() / dest.height() - 2.0).abs() < 1.0e-3);
     }
 }

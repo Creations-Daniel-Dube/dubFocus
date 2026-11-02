@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use cudarc::cufft::result as cufft_result;
 use cudarc::cufft::CudaFft;
 use cudarc::cufft::sys::{self as cufft_sys, float2};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
@@ -62,6 +63,149 @@ pub fn unsupported_message(major: i32, minor: i32) -> String {
     format!(
         "Carte non prise en charge (compute {major}.{minor}). dubFocus exige une GTX 1060 (6.1) ou une carte plus récente."
     )
+}
+
+/// Marge laissée au pilote. Sur Windows, remplir la mémoire d'une carte de 3 Gio
+/// peut bloquer `cuMemAlloc` au lieu de renvoyer une erreur : l'interface reste
+/// alors sur « Lecture… » sans aperçu.
+const GPU_MARGIN: usize = 256 * 1024 * 1024;
+const PREVIEW_PIXELS: usize = 6_000_000;
+const PREVIEW_EDGE: u32 = 2048;
+const MIN_EDGE: u32 = 320;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorkingSize {
+    pub width: u32,
+    pub height: u32,
+    pub coord_scale: f32,
+    pub memory_limited: bool,
+}
+
+pub fn picture_bytes(width: i32, height: i32, channels: i32) -> usize {
+    let pixels = (width.max(0) as usize).saturating_mul(height.max(0) as usize);
+    let channels = channels.max(1) as usize;
+    pixels.saturating_mul(4).saturating_mul(channels.saturating_mul(2).saturating_add(3))
+}
+
+pub fn spectrum_bytes(fft_w: i32, fft_h: i32) -> usize {
+    let real_n = (fft_w.max(0) as usize).saturating_mul(fft_h.max(0) as usize);
+    let spec_n = (fft_w.max(0) as usize / 2 + 1).saturating_mul(fft_h.max(0) as usize);
+    real_n.saturating_mul(9 * 4).saturating_add(spec_n.saturating_mul(4 * 8))
+}
+
+/// Coussin pour les deux plans cuFFT, sans interroger le pilote.
+fn planned_workspace(fft_w: i32, fft_h: i32) -> usize {
+    (fft_w.max(0) as usize).saturating_mul(fft_h.max(0) as usize).saturating_mul(24)
+}
+
+/// Taille annoncée par cuFFT pour les deux plans, ou le coussin si l'estimation échoue.
+pub fn measured_workspace(fft_w: i32, fft_h: i32) -> usize {
+    let fallback = planned_workspace(fft_w, fft_h);
+    let kind_r = cufft_sys::cufftType::CUFFT_R2C;
+    let kind_c = cufft_sys::cufftType::CUFFT_C2R;
+    match (cufft_result::estimate_2d(fft_w, fft_h, kind_r), cufft_result::estimate_2d(fft_w, fft_h, kind_c)) {
+        (Ok(forward), Ok(inverse)) => forward.saturating_add(inverse).saturating_add(32 * 1024 * 1024).max(fallback),
+        _ => fallback,
+    }
+}
+
+pub fn device_bytes(width: i32, height: i32, channels: i32) -> usize {
+    device_bytes_with(width, height, channels, planned_workspace)
+}
+
+fn device_bytes_with(width: i32, height: i32, channels: i32, workspace: fn(i32, i32) -> usize) -> usize {
+    let (fft_w, fft_h, _, _) = geometry(width, height, PsfKind::Gaussian, 8.0);
+    picture_bytes(width, height, channels)
+        .saturating_add(spectrum_bytes(fft_w, fft_h))
+        .saturating_add(workspace(fft_w, fft_h))
+}
+
+pub fn plan_working_size(width: u32, height: u32, channels: usize, preview: bool, budget: usize) -> Result<WorkingSize, Error> {
+    plan_working_size_with(width, height, channels, preview, budget, planned_workspace)
+}
+
+/// Comme [`plan_working_size`], avec l'estimation cuFFT du poste de travail.
+pub fn plan_working_size_measured(width: u32, height: u32, channels: usize, preview: bool, budget: usize) -> Result<WorkingSize, Error> {
+    plan_working_size_with(width, height, channels, preview, budget, measured_workspace)
+}
+
+fn plan_working_size_with(
+    width: u32,
+    height: u32,
+    channels: usize,
+    preview: bool,
+    budget: usize,
+    workspace: fn(i32, i32) -> usize,
+) -> Result<WorkingSize, Error> {
+    if width == 0 || height == 0 || channels == 0 {
+        return Err(Error::new("image vide"));
+    }
+    let (mut target_w, mut target_h) = (width, height);
+    if preview {
+        let long = width.max(height);
+        let pixels = (width as usize).saturating_mul(height as usize);
+        if pixels > PREVIEW_PIXELS && long > PREVIEW_EDGE {
+            (target_w, target_h) = fit_long_edge(width, height, PREVIEW_EDGE);
+        }
+    }
+    if fits(target_w, target_h, channels, budget, workspace) {
+        return Ok(WorkingSize {
+            width: target_w,
+            height: target_h,
+            coord_scale: scale_of(width, target_w),
+            memory_limited: false,
+        });
+    }
+    let mut edge = target_w.max(target_h);
+    while edge > MIN_EDGE {
+        edge = ((edge as f32) * 0.85).floor() as u32;
+        if edge < MIN_EDGE {
+            edge = MIN_EDGE;
+        }
+        let (candidate_w, candidate_h) = fit_long_edge(width, height, edge);
+        if fits(candidate_w, candidate_h, channels, budget, workspace) {
+            return Ok(WorkingSize {
+                width: candidate_w,
+                height: candidate_h,
+                coord_scale: scale_of(width, candidate_w),
+                memory_limited: true,
+            });
+        }
+        if edge == MIN_EDGE {
+            break;
+        }
+    }
+    Err(Error::new(
+        "La mémoire libre de la carte ne suffit pas pour calculer un aperçu de cette image.",
+    ))
+}
+
+fn fits(width: u32, height: u32, channels: usize, budget: usize, workspace: fn(i32, i32) -> usize) -> bool {
+    budget > 0 && device_bytes_with(width as i32, height as i32, channels as i32, workspace) <= budget
+}
+
+fn scale_of(full: u32, working: u32) -> f32 {
+    if working == 0 || working == full { 1.0 } else { full as f32 / working as f32 }
+}
+
+fn fit_long_edge(width: u32, height: u32, edge: u32) -> (u32, u32) {
+    let long = width.max(height).max(1);
+    if long <= edge {
+        return (width.max(1), height.max(1));
+    }
+    let scale = edge as f32 / long as f32;
+    let target_w = ((width as f32) * scale).round().max(1.0) as u32;
+    let target_h = ((height as f32) * scale).round().max(1.0) as u32;
+    (target_w, target_h)
+}
+
+pub fn full_resolution_error(width: u32, height: u32, channels: usize, budget: usize) -> Error {
+    let need = device_bytes_with(width as i32, height as i32, channels as i32, measured_workspace);
+    Error::new(format!(
+        "La mémoire libre de la carte ne suffit pas pour {width} × {height} en pleine résolution (environ {} Mio nécessaires, {} Mio utilisables). L'aperçu réduit reste affiché.",
+        need / (1024 * 1024),
+        budget / (1024 * 1024)
+    ))
 }
 
 pub fn probe_document(info: &GpuInfo) -> String {
@@ -260,6 +404,16 @@ impl Session {
         })
     }
 
+    pub fn has_picture(&self) -> bool {
+        self.picture.is_some()
+    }
+
+    /// Mémoire utilisable pour une nouvelle image, une fois les tampons actuels libérés.
+    pub fn memory_budget(&self) -> Result<usize, Error> {
+        let (free, _) = self.gpu.stream.context().mem_get_info().map_err(gpu_err)?;
+        Ok(free.saturating_add(self.resident_bytes()).saturating_sub(GPU_MARGIN))
+    }
+
     pub fn load(&mut self, interleaved: &[f32], luma: &[f32], width: i32, height: i32, channels: i32, mean: f32) -> Result<(), Error> {
         if width <= 0 || height <= 0 || width > 20_000 || height > 20_000 {
             return Err(Error::new("image trop grande ou vide"));
@@ -268,6 +422,10 @@ impl Session {
         if luma.len() != pixels || interleaved.len() != pixels * channels as usize {
             return Err(Error::new("tampon image incohérent"));
         }
+        let need = picture_bytes(width, height, channels);
+        self.ensure_budget(need, self.resident_bytes())?;
+        self.release_all()?;
+        self.ensure_free(need)?;
         let stream = &self.gpu.stream;
         let original = stream.clone_htod(interleaved).map_err(gpu_err)?;
         let luma_buf = stream.clone_htod(luma).map_err(gpu_err)?;
@@ -446,7 +604,28 @@ impl Session {
         if real_n > 1_000_000_000 {
             return Err(Error::new("FFT trop grande pour la mémoire"));
         }
-        let stream = &self.gpu.stream;
+        let buffers = spectrum_bytes(fft_w, fft_h);
+        let work = measured_workspace(fft_w, fft_h);
+        self.ensure_budget(buffers.saturating_add(work), self.spectrum_resident())?;
+        self.release_spectrum()?;
+        self.ensure_free(buffers.saturating_add(work))?;
+        let stream = Arc::clone(&self.gpu.stream);
+        let observed = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let obj = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let wiener = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let reblur = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let ratio = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let correction = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let tmp = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let mask = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let psf = stream.alloc_zeros(real_n).map_err(gpu_err)?;
+        let y_fft = stream.alloc_zeros(spec_n).map_err(gpu_err)?;
+        let h_fft = stream.alloc_zeros(spec_n).map_err(gpu_err)?;
+        let spec_a = stream.alloc_zeros(spec_n).map_err(gpu_err)?;
+        let spec_b = stream.alloc_zeros(spec_n).map_err(gpu_err)?;
+        self.ensure_free(work)?;
+        let r2c = CudaFft::plan_2d(fft_w, fft_h, cufft_sys::cufftType::CUFFT_R2C, stream.clone()).map_err(gpu_err)?;
+        let c2r = CudaFft::plan_2d(fft_w, fft_h, cufft_sys::cufftType::CUFFT_C2R, stream.clone()).map_err(gpu_err)?;
         let mut spectrum = Spectrum {
             fft_w,
             fft_h,
@@ -454,21 +633,21 @@ impl Session {
             origin_y,
             real_n,
             spec_n,
-            observed: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            obj: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            wiener: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            reblur: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            ratio: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            correction: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            tmp: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            mask: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            psf: stream.alloc_zeros(real_n).map_err(gpu_err)?,
-            y_fft: stream.alloc_zeros(spec_n).map_err(gpu_err)?,
-            h_fft: stream.alloc_zeros(spec_n).map_err(gpu_err)?,
-            spec_a: stream.alloc_zeros(spec_n).map_err(gpu_err)?,
-            spec_b: stream.alloc_zeros(spec_n).map_err(gpu_err)?,
-            r2c: CudaFft::plan_2d(fft_w, fft_h, cufft_sys::cufftType::CUFFT_R2C, stream.clone()).map_err(gpu_err)?,
-            c2r: CudaFft::plan_2d(fft_w, fft_h, cufft_sys::cufftType::CUFFT_C2R, stream.clone()).map_err(gpu_err)?,
+            observed,
+            obj,
+            wiener,
+            reblur,
+            ratio,
+            correction,
+            tmp,
+            mask,
+            psf,
+            y_fft,
+            h_fft,
+            spec_a,
+            spec_b,
+            r2c,
+            c2r,
             y_ready: false,
             mask_ready: false,
         };
@@ -675,6 +854,70 @@ impl Session {
         );
         Ok(())
     }
+
+    fn resident_bytes(&self) -> usize {
+        self.picture_resident() + self.spectrum_resident() + self.shade.as_ref().map(|shade| shade.num_bytes()).unwrap_or(0)
+    }
+
+    fn picture_resident(&self) -> usize {
+        let Some(picture) = &self.picture else { return 0 };
+        picture.original.num_bytes()
+            + picture.luma.num_bytes()
+            + picture.y_in.num_bytes()
+            + picture.y_out.num_bytes()
+            + picture.processed.num_bytes()
+    }
+
+    fn spectrum_resident(&self) -> usize {
+        let Some(spectrum) = &self.spectrum else { return 0 };
+        spectrum.observed.num_bytes()
+            + spectrum.obj.num_bytes()
+            + spectrum.wiener.num_bytes()
+            + spectrum.reblur.num_bytes()
+            + spectrum.ratio.num_bytes()
+            + spectrum.correction.num_bytes()
+            + spectrum.tmp.num_bytes()
+            + spectrum.mask.num_bytes()
+            + spectrum.psf.num_bytes()
+            + spectrum.y_fft.num_bytes()
+            + spectrum.h_fft.num_bytes()
+            + spectrum.spec_a.num_bytes()
+            + spectrum.spec_b.num_bytes()
+    }
+
+    /// Refuse avant d'appeler le pilote. `reclaim` est la mémoire que l'appelant va libérer.
+    fn ensure_budget(&self, need: usize, reclaim: usize) -> Result<(), Error> {
+        let (free, _) = self.gpu.stream.context().mem_get_info().map_err(gpu_err)?;
+        let usable = free.saturating_add(reclaim).saturating_sub(GPU_MARGIN);
+        if need > usable {
+            return Err(memory_error(need, free.saturating_add(reclaim)));
+        }
+        Ok(())
+    }
+
+    fn ensure_free(&self, need: usize) -> Result<(), Error> {
+        let (free, _) = self.gpu.stream.context().mem_get_info().map_err(gpu_err)?;
+        if need.saturating_add(64 * 1024 * 1024) > free {
+            return Err(memory_error(need, free));
+        }
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> Result<(), Error> {
+        self.picture = None;
+        self.spectrum = None;
+        self.shade = None;
+        self.have_wiener = false;
+        self.have_rl = false;
+        self.gpu.stream.synchronize().map_err(gpu_err)
+    }
+
+    fn release_spectrum(&mut self) -> Result<(), Error> {
+        self.spectrum = None;
+        self.have_wiener = false;
+        self.have_rl = false;
+        self.gpu.stream.synchronize().map_err(gpu_err)
+    }
 }
 
 impl Gpu {
@@ -685,6 +928,14 @@ impl Gpu {
 
 fn gpu_err(err: impl ToString) -> Error {
     Error::new(format!("CUDA : {}", err.to_string()))
+}
+
+fn memory_error(need: usize, available: usize) -> Error {
+    Error::new(format!(
+        "Mémoire GPU insuffisante : {} Mio demandés, {} Mio disponibles. L'allocation a été refusée pour éviter un blocage du pilote.",
+        need / (1024 * 1024),
+        available / (1024 * 1024)
+    ))
 }
 
 /// Une 1060 a besoin d'un pilote de la branche 580, le dernier qui expose CUDA 12 pour Pascal.
@@ -947,5 +1198,50 @@ mod tests {
             acc / count
         };
         assert!(crop(&restored) > crop(&luma) * 1.05, "le limbe ne gagne pas en netteté");
+    }
+
+    #[test]
+    fn small_image_stays_full_size_when_memory_is_plenty() {
+        let size = plan_working_size(800, 600, 3, false, 2 * 1024 * 1024 * 1024).unwrap();
+        assert_eq!((size.width, size.height, size.memory_limited), (800, 600, false));
+        assert!((size.coord_scale - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn large_image_shrinks_to_a_three_gigabyte_budget() {
+        let budget = 2 * 1024 * 1024 * 1024;
+        let full = device_bytes(6000, 4000, 3);
+        let size = plan_working_size(6000, 4000, 3, false, budget).unwrap();
+        if full <= budget {
+            assert!(!size.memory_limited);
+            assert_eq!((size.width, size.height), (6000, 4000));
+        } else {
+            assert!(size.memory_limited);
+            assert!(size.width < 6000);
+            assert!(device_bytes(size.width as i32, size.height as i32, 3) <= budget);
+            assert!((size.coord_scale - 6000.0 / size.width as f32).abs() < 1.0e-3);
+        }
+    }
+
+    #[test]
+    fn twelve_gigabytes_keep_a_full_frame() {
+        let budget = 10 * 1024 * 1024 * 1024;
+        let size = plan_working_size(6000, 4000, 3, false, budget).unwrap();
+        assert_eq!((size.width, size.height), (6000, 4000));
+        assert!(!size.memory_limited);
+    }
+
+    #[test]
+    fn preview_cap_still_limits_the_long_edge() {
+        let size = plan_working_size(8000, 4000, 3, true, 16 * 1024 * 1024 * 1024).unwrap();
+        assert!(size.width.max(size.height) <= 2048);
+        assert!(size.width < 8000);
+        assert!(!size.memory_limited);
+    }
+
+    #[test]
+    fn tiny_budget_refuses_instead_of_allocating() {
+        let error = plan_working_size(8000, 6000, 3, false, 8 * 1024 * 1024).unwrap_err();
+        assert!(error.message.contains("mémoire"));
     }
 }

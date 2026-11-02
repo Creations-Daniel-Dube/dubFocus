@@ -59,6 +59,52 @@ pub fn encode_u16(value: f32) -> u16 {
     scaled.clamp(0.0, 65535.0) as u16
 }
 
+/// Aperçu RGBA de l'image telle qu'elle est lue, avant le calcul GPU.
+pub fn preview_rgba(samples: &[f32], width: u32, height: u32, channels: usize, treat_srgb: bool) -> (u32, u32, Vec<u8>) {
+    const EDGE: u32 = 1280;
+    let (target_w, target_h) = if width.max(height) <= EDGE || width == 0 || height == 0 {
+        (width.max(1), height.max(1))
+    } else {
+        let scale = EDGE as f32 / width.max(height) as f32;
+        (
+            ((width as f32) * scale).round().max(1.0) as u32,
+            ((height as f32) * scale).round().max(1.0) as u32,
+        )
+    };
+    let working = if target_w == width && target_h == height {
+        samples.to_vec()
+    } else {
+        downscale(samples, width as usize, height as usize, channels, target_w as usize, target_h as usize)
+    };
+    let pixels = target_w as usize * target_h as usize;
+    let mut rgba = vec![0u8; pixels * 4];
+    for index in 0..pixels {
+        let (red, green, blue) = if channels <= 1 {
+            let value = preview_byte(working[index], treat_srgb);
+            (value, value, value)
+        } else {
+            let pixel = index * channels;
+            (
+                preview_byte(working[pixel], treat_srgb),
+                preview_byte(working[pixel + 1], treat_srgb),
+                preview_byte(working[pixel + 2], treat_srgb),
+            )
+        };
+        let offset = index * 4;
+        rgba[offset] = red;
+        rgba[offset + 1] = green;
+        rgba[offset + 2] = blue;
+        rgba[offset + 3] = 255;
+    }
+    (target_w, target_h, rgba)
+}
+
+fn preview_byte(value: f32, treat_srgb: bool) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if treat_srgb { value } else { linear_to_srgb(value) };
+    (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+}
+
 pub fn downscale(samples: &[f32], width: usize, height: usize, channels: usize, target_w: usize, target_h: usize) -> Vec<f32> {
     let mut dst = vec![0.0f32; target_w * target_h * channels];
     for y in 0..target_h {
@@ -105,5 +151,21 @@ mod tests {
     fn rec709_luma_of_white_is_one() {
         let y = luminance(&[1.0, 1.0, 1.0], 3);
         assert!((y[0] - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn preview_rgba_keeps_a_small_frame_and_opaque_alpha() {
+        let (width, height, pixels) = preview_rgba(&[0.0, 1.0, 0.0, 1.0], 2, 1, 1, true);
+        assert_eq!((width, height, pixels.len()), (2, 1, 8));
+        assert_eq!(&pixels[4..], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn preview_rgba_limits_the_long_edge() {
+        let samples = vec![0.5f32; 4000 * 2000];
+        let (width, height, pixels) = preview_rgba(&samples, 4000, 2000, 1, true);
+        assert_eq!(width, 1280);
+        assert_eq!(height, 640);
+        assert_eq!(pixels.len(), 1280 * 640 * 4);
     }
 }

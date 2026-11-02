@@ -4,14 +4,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::color::{downscale, luminance, mean, to_linear};
+use crate::color::{downscale, luminance, mean, preview_rgba, to_linear};
 use crate::error::Error;
-use crate::gpu::{Session, ViewRequest};
+use crate::gpu::{self, Session, ViewRequest};
 use crate::io::{self, ImageData, SaveKind};
 use crate::psf::PsfKind;
-
-const PREVIEW_PIXELS: usize = 6_000_000;
-const PREVIEW_EDGE: u32 = 2048;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessParams {
@@ -78,6 +75,18 @@ enum Cmd {
 }
 
 pub enum Msg {
+    Decoded {
+        ticket: u64,
+        width: u32,
+        height: u32,
+        channels: usize,
+        bit_depth: u8,
+        treat_srgb: bool,
+        view_w: u32,
+        view_h: u32,
+        pixels: Vec<u8>,
+    },
+    Status { ticket: u64, text: String },
     Ready {
         ticket: u64,
         width: u32,
@@ -86,6 +95,7 @@ pub enum Msg {
         bit_depth: u8,
         millis: u128,
         preview: bool,
+        memory_limited: bool,
         refined: bool,
         treat_srgb: bool,
     },
@@ -150,18 +160,12 @@ struct Job {
     params: ProcessParams,
     coord_scale: f32,
     refined: bool,
+    memory_limited: bool,
     loaded_key: Option<(bool, bool, u64)>,
 }
 
 fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, cancel: Arc<AtomicBool>) {
-    let mut session = match Session::new() {
-        Ok(session) => session,
-        Err(err) => {
-            let _ = tx.send(Msg::Error { ticket: 0, message: err.message });
-            while rx.recv().is_ok() {}
-            return;
-        }
-    };
+    let mut session: Option<Session> = None;
     let mut job: Option<Job> = None;
     let mut stash: Option<Cmd> = None;
     loop {
@@ -175,17 +179,55 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, cancel: Arc<AtomicBool>) {
         };
         let cmd = coalesce(incoming, &rx, &mut stash);
         let outcome = match cmd {
-            Cmd::Open { path, params, ticket } => open_path(&mut session, &tx, &cancel, &mut job, &path, params, ticket),
-            Cmd::Params { params, ticket } => update_params(&mut session, &tx, &cancel, &mut job, params, ticket),
-            Cmd::Refine { params, ticket } => refine(&mut session, &tx, &cancel, &mut job, params, ticket),
-            Cmd::Dering { value, ticket } => retint(&mut session, &tx, &mut job, value, ticket),
-            Cmd::Shade(request) => shade(&mut session, &tx, job.as_ref(), request),
-            Cmd::Export(request) => export(&mut session, &tx, &cancel, &mut job, request),
+            Cmd::Open { path, params, ticket } => open_command(&mut session, &tx, &cancel, &mut job, &path, params, ticket),
+            Cmd::Params { params, ticket } => {
+                match ready_session(&mut session, &tx, ticket) {
+                    Ok(session) => update_params(session, &tx, &cancel, &mut job, params, ticket),
+                    Err(err) => Err(err),
+                }
+            }
+            Cmd::Refine { params, ticket } => {
+                match ready_session(&mut session, &tx, ticket) {
+                    Ok(session) => refine(session, &tx, &cancel, &mut job, params, ticket),
+                    Err(err) => Err(err),
+                }
+            }
+            Cmd::Dering { value, ticket } => {
+                match ready_session(&mut session, &tx, ticket) {
+                    Ok(session) => retint(session, &tx, &mut job, value, ticket),
+                    Err(err) => Err(err),
+                }
+            }
+            Cmd::Shade(request) => {
+                let ticket = request.ticket;
+                match ready_session(&mut session, &tx, ticket) {
+                    Ok(session) => shade(session, &tx, job.as_ref(), request),
+                    Err(err) => Err(err),
+                }
+            }
+            Cmd::Export(request) => {
+                let ticket = request.ticket;
+                match ready_session(&mut session, &tx, ticket) {
+                    Ok(session) => export(session, &tx, &cancel, &mut job, request),
+                    Err(err) => Err(err),
+                }
+            }
         };
         if let Err((ticket, err)) = outcome {
             let _ = tx.send(Msg::Error { ticket, message: err.message });
         }
     }
+}
+
+fn ready_session<'a>(session: &'a mut Option<Session>, tx: &Sender<Msg>, ticket: u64) -> Result<&'a mut Session, (u64, Error)> {
+    if session.is_none() {
+        let _ = tx.send(Msg::Status { ticket, text: "Initialisation CUDA…".to_string() });
+        match Session::new() {
+            Ok(value) => *session = Some(value),
+            Err(err) => return Err((ticket, err)),
+        }
+    }
+    Ok(session.as_mut().unwrap())
 }
 
 fn coalesce(mut cmd: Cmd, rx: &Receiver<Cmd>, stash: &mut Option<Cmd>) -> Cmd {
@@ -212,8 +254,8 @@ fn coalesce(mut cmd: Cmd, rx: &Receiver<Cmd>, stash: &mut Option<Cmd>) -> Cmd {
     cmd
 }
 
-fn open_path(
-    session: &mut Session,
+fn open_command(
+    session: &mut Option<Session>,
     tx: &Sender<Msg>,
     cancel: &AtomicBool,
     job: &mut Option<Job>,
@@ -223,6 +265,19 @@ fn open_path(
 ) -> Result<(), (u64, Error)> {
     let image = io::load_path(path).map_err(|err| (ticket, err))?;
     params.treat_srgb = image.suggest_srgb();
+    let (view_w, view_h, pixels) = preview_rgba(&image.samples, image.width, image.height, image.channels, params.treat_srgb);
+    let _ = tx.send(Msg::Decoded {
+        ticket,
+        width: image.width,
+        height: image.height,
+        channels: image.channels,
+        bit_depth: image.bit_depth,
+        treat_srgb: params.treat_srgb,
+        view_w,
+        view_h,
+        pixels,
+    });
+    let session = ready_session(session, tx, ticket)?;
     let generation = job.as_ref().map(|job| job.generation.wrapping_add(1)).unwrap_or(1);
     *job = Some(Job {
         raw: image,
@@ -230,9 +285,11 @@ fn open_path(
         params,
         coord_scale: 1.0,
         refined: false,
+        memory_limited: false,
         loaded_key: None,
     });
-    restore(session, tx, cancel, job.as_mut().unwrap(), ticket, false)
+    let _ = tx.send(Msg::Status { ticket, text: "Calcul sur le GPU…".to_string() });
+    restore(session, tx, cancel, job.as_mut().unwrap(), ticket, true, false)
 }
 
 fn update_params(
@@ -248,7 +305,7 @@ fn update_params(
     };
     job.params = params;
     job.refined = false;
-    restore(session, tx, cancel, job, ticket, false)
+    restore(session, tx, cancel, job, ticket, true, false)
 }
 
 fn refine(
@@ -264,9 +321,15 @@ fn refine(
     };
     job.params = params;
     job.params.preview = false;
-    if job.coord_scale != 1.0 {
+    if job.coord_scale != 1.0 || job.memory_limited {
+        let saved = job.loaded_key;
         job.loaded_key = None;
-        reload(session, job).map_err(|err| (ticket, err))?;
+        if let Err(err) = reload(session, job, false) {
+            if session.has_picture() {
+                job.loaded_key = saved;
+            }
+            return Err((ticket, err));
+        }
         session.wiener(job.params.kind, job.params.radius, job.params.k()).map_err(|err| (ticket, err))?;
     }
     cancel.store(false, Ordering::Relaxed);
@@ -328,8 +391,14 @@ fn export(session: &mut Session, tx: &Sender<Msg>, cancel: &AtomicBool, job: &mu
         return Ok(());
     };
     job.params.preview = false;
+    let saved = job.loaded_key;
     job.loaded_key = None;
-    restore(session, tx, cancel, job, request.ticket, true)?;
+    if let Err(err) = restore(session, tx, cancel, job, request.ticket, false, true) {
+        if session.has_picture() {
+            job.loaded_key = saved;
+        }
+        return Err(err);
+    }
     if !job.refined {
         return Ok(());
     }
@@ -357,11 +426,12 @@ fn restore(
     cancel: &AtomicBool,
     job: &mut Job,
     ticket: u64,
+    allow_shrink: bool,
     quiet: bool,
 ) -> Result<(), (u64, Error)> {
     cancel.store(false, Ordering::Relaxed);
     let started = Instant::now();
-    reload(session, job).map_err(|err| (ticket, err))?;
+    reload(session, job, allow_shrink).map_err(|err| (ticket, err))?;
     session.wiener(job.params.kind, job.params.radius, job.params.k()).map_err(|err| (ticket, err))?;
     let tx_progress = tx.clone();
     let finished = session
@@ -380,36 +450,42 @@ fn restore(
     Ok(())
 }
 
-fn reload(session: &mut Session, job: &mut Job) -> Result<(), Error> {
+fn reload(session: &mut Session, job: &mut Job, allow_shrink: bool) -> Result<(), Error> {
     let key = (job.params.treat_srgb, job.params.preview, job.generation);
-    if job.loaded_key == Some(key) {
+    if allow_shrink && job.loaded_key == Some(key) {
         return Ok(());
     }
+    let budget = session.memory_budget()?;
+    let planned = if allow_shrink {
+        gpu::plan_working_size_measured(job.raw.width, job.raw.height, job.raw.channels, job.params.preview, budget)?
+    } else {
+        let full = gpu::plan_working_size_measured(job.raw.width, job.raw.height, job.raw.channels, false, budget)?;
+        if full.memory_limited || full.width != job.raw.width || full.height != job.raw.height {
+            return Err(gpu::full_resolution_error(job.raw.width, job.raw.height, job.raw.channels, budget));
+        }
+        full
+    };
     let linear = to_linear(&job.raw.samples, job.params.treat_srgb);
-    let (width, height, coord_scale) = working_size(job.raw.width, job.raw.height, job.params.preview);
-    let working = if width == job.raw.width && height == job.raw.height {
+    let working = if planned.width == job.raw.width && planned.height == job.raw.height {
         linear
     } else {
-        downscale(&linear, job.raw.width as usize, job.raw.height as usize, job.raw.channels, width as usize, height as usize)
+        downscale(
+            &linear,
+            job.raw.width as usize,
+            job.raw.height as usize,
+            job.raw.channels,
+            planned.width as usize,
+            planned.height as usize,
+        )
     };
     let luma = luminance(&working, job.raw.channels);
     let average = mean(&luma);
-    session.load(&working, &luma, width as i32, height as i32, job.raw.channels as i32, average)?;
-    job.coord_scale = coord_scale;
+    job.loaded_key = None;
+    session.load(&working, &luma, planned.width as i32, planned.height as i32, job.raw.channels as i32, average)?;
+    job.coord_scale = planned.coord_scale;
+    job.memory_limited = planned.memory_limited;
     job.loaded_key = Some(key);
     Ok(())
-}
-
-fn working_size(width: u32, height: u32, preview: bool) -> (u32, u32, f32) {
-    let long = width.max(height);
-    let pixels = width as usize * height as usize;
-    if !preview || pixels <= PREVIEW_PIXELS || long <= PREVIEW_EDGE {
-        return (width, height, 1.0);
-    }
-    let scale = PREVIEW_EDGE as f32 / long as f32;
-    let target_w = ((width as f32) * scale).round().max(1.0) as u32;
-    let target_h = ((height as f32) * scale).round().max(1.0) as u32;
-    (target_w, target_h, width as f32 / target_w as f32)
 }
 
 fn ready(job: &Job, ticket: u64, millis: u128, refined: bool) -> Msg {
@@ -421,6 +497,7 @@ fn ready(job: &Job, ticket: u64, millis: u128, refined: bool) -> Msg {
         bit_depth: job.raw.bit_depth,
         millis,
         preview: job.coord_scale != 1.0,
+        memory_limited: job.memory_limited,
         refined,
         treat_srgb: job.params.treat_srgb,
     }
