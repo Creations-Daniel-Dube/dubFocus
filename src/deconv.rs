@@ -431,8 +431,30 @@ fn restore(
 ) -> Result<(), (u64, Error)> {
     cancel.store(false, Ordering::Relaxed);
     let started = Instant::now();
+    if !quiet {
+        let _ = tx.send(Msg::Status { ticket, text: "Préparation GPU…".to_string() });
+    }
     reload(session, job, allow_shrink).map_err(|err| (ticket, err))?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if !quiet {
+        let _ = tx.send(Msg::Status { ticket, text: "Filtre de Wiener…".to_string() });
+    }
     session.wiener(job.params.kind, job.params.radius, job.params.k()).map_err(|err| (ticket, err))?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if !quiet {
+        let _ = tx.send(Msg::Status {
+            ticket,
+            text: if job.params.preview {
+                "Richardson-Lucy, aperçu…".to_string()
+            } else {
+                "Richardson-Lucy…".to_string()
+            },
+        });
+    }
     let tx_progress = tx.clone();
     let finished = session
         .refine(job.params.iterations, job.params.k(), job.params.damping, job.params.dering, cancel, |done, total| {

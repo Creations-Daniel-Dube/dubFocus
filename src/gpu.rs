@@ -66,11 +66,15 @@ pub fn unsupported_message(major: i32, minor: i32) -> String {
 }
 
 /// Marge laissée au pilote. Sur Windows, remplir la mémoire d'une carte de 3 Gio
-/// peut bloquer `cuMemAlloc` au lieu de renvoyer une erreur : l'interface reste
-/// alors sur « Lecture… » sans aperçu.
-const GPU_MARGIN: usize = 256 * 1024 * 1024;
+/// peut bloquer `cuMemAlloc` / `cufftPlan2d` au lieu de renvoyer une erreur : le
+/// statut reste alors sur « Richardson-Lucy… » avec le GPU quasi inactif.
+const GPU_MARGIN: usize = 512 * 1024 * 1024;
+/// En dessous, on plafonne aussi hors aperçu : une 1060 3 Gio « tient » ~0,9 Gio
+/// sur le papier, puis le pilote se fige à la création des plans cuFFT.
+const LOW_VRAM_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 const PREVIEW_PIXELS: usize = 6_000_000;
 const PREVIEW_EDGE: u32 = 2048;
+const LOW_VRAM_EDGE: u32 = 1536;
 const MIN_EDGE: u32 = 320;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,8 +98,12 @@ pub fn spectrum_bytes(fft_w: i32, fft_h: i32) -> usize {
 }
 
 /// Coussin pour les deux plans cuFFT, sans interroger le pilote.
+/// Volontairement large : `cufftPlan2d` alloue plus que `estimate_2d` sur Pascal.
 fn planned_workspace(fft_w: i32, fft_h: i32) -> usize {
-    (fft_w.max(0) as usize).saturating_mul(fft_h.max(0) as usize).saturating_mul(24)
+    (fft_w.max(0) as usize)
+        .saturating_mul(fft_h.max(0) as usize)
+        .saturating_mul(48)
+        .saturating_add(128 * 1024 * 1024)
 }
 
 /// Taille annoncée par cuFFT pour les deux plans, ou le coussin si l'estimation échoue.
@@ -104,11 +112,15 @@ pub fn measured_workspace(fft_w: i32, fft_h: i32) -> usize {
     let kind_r = cufft_sys::cufftType::CUFFT_R2C;
     let kind_c = cufft_sys::cufftType::CUFFT_C2R;
     match (cufft_result::estimate_2d(fft_w, fft_h, kind_r), cufft_result::estimate_2d(fft_w, fft_h, kind_c)) {
-        (Ok(forward), Ok(inverse)) => forward.saturating_add(inverse).saturating_add(32 * 1024 * 1024).max(fallback),
+        (Ok(forward), Ok(inverse)) => forward
+            .saturating_add(inverse)
+            .saturating_add(128 * 1024 * 1024)
+            .max(fallback),
         _ => fallback,
     }
 }
 
+#[cfg(test)]
 pub fn device_bytes(width: i32, height: i32, channels: i32) -> usize {
     device_bytes_with(width, height, channels, planned_workspace)
 }
@@ -120,6 +132,7 @@ fn device_bytes_with(width: i32, height: i32, channels: i32, workspace: fn(i32, 
         .saturating_add(workspace(fft_w, fft_h))
 }
 
+#[cfg(test)]
 pub fn plan_working_size(width: u32, height: u32, channels: usize, preview: bool, budget: usize) -> Result<WorkingSize, Error> {
     plan_working_size_with(width, height, channels, preview, budget, planned_workspace)
 }
@@ -140,12 +153,22 @@ fn plan_working_size_with(
     if width == 0 || height == 0 || channels == 0 {
         return Err(Error::new("image vide"));
     }
+    let low_vram = budget < LOW_VRAM_BUDGET;
+    let edge_cap = if preview {
+        Some(PREVIEW_EDGE)
+    } else if low_vram {
+        Some(LOW_VRAM_EDGE)
+    } else {
+        None
+    };
     let (mut target_w, mut target_h) = (width, height);
-    if preview {
+    let mut forced_cap = false;
+    if let Some(edge) = edge_cap {
         let long = width.max(height);
         let pixels = (width as usize).saturating_mul(height as usize);
-        if pixels > PREVIEW_PIXELS && long > PREVIEW_EDGE {
-            (target_w, target_h) = fit_long_edge(width, height, PREVIEW_EDGE);
+        if long > edge || (preview && pixels > PREVIEW_PIXELS) {
+            (target_w, target_h) = fit_long_edge(width, height, edge);
+            forced_cap = target_w != width || target_h != height;
         }
     }
     if fits(target_w, target_h, channels, budget, workspace) {
@@ -153,7 +176,8 @@ fn plan_working_size_with(
             width: target_w,
             height: target_h,
             coord_scale: scale_of(width, target_w),
-            memory_limited: false,
+            // Hors aperçu, un plafond basse VRAM compte comme limite mémoire.
+            memory_limited: forced_cap && !preview,
         });
     }
     let mut edge = target_w.max(target_h);
@@ -897,7 +921,7 @@ impl Session {
 
     fn ensure_free(&self, need: usize) -> Result<(), Error> {
         let (free, _) = self.gpu.stream.context().mem_get_info().map_err(gpu_err)?;
-        if need.saturating_add(64 * 1024 * 1024) > free {
+        if need.saturating_add(128 * 1024 * 1024) > free {
             return Err(memory_error(need, free));
         }
         Ok(())
@@ -1237,6 +1261,24 @@ mod tests {
         assert!(size.width.max(size.height) <= 2048);
         assert!(size.width < 8000);
         assert!(!size.memory_limited);
+    }
+
+    #[test]
+    fn preview_caps_three_megapixel_frames() {
+        // Avant : pixels == PREVIEW_PIXELS ne déclenchait pas la réduction.
+        let size = plan_working_size(3000, 2000, 3, true, 16 * 1024 * 1024 * 1024).unwrap();
+        assert!(size.width.max(size.height) <= PREVIEW_EDGE);
+        assert!(size.width < 3000);
+        assert!(!size.memory_limited);
+    }
+
+    #[test]
+    fn low_vram_budget_caps_outside_preview() {
+        let budget = 1800 * 1024 * 1024;
+        let size = plan_working_size(6000, 4000, 3, false, budget).unwrap();
+        assert!(size.width.max(size.height) <= LOW_VRAM_EDGE);
+        assert!(size.memory_limited);
+        assert!(device_bytes(size.width as i32, size.height as i32, 3) <= budget);
     }
 
     #[test]

@@ -13,7 +13,7 @@ Le calcul porte sur la luminance. La couleur d’origine est réappliquée ensui
 3. Une régularisation laplacienne et un amortissement freinent le bruit dans les zones faibles.
 4. Un anti-ringing atténue les anneaux qui apparaissent autour des étoiles brillantes et des bords contrastés.
 
-Pendant le déplacement d’un curseur, les grandes images sont traitées en aperçu réduit (grand côté ramené vers 2048 pixels). Le bouton **Raffiner** relance Richardson-Lucy à pleine résolution. Sur une carte peu dotée en mémoire, comme une GTX 1060 de 3 Gio, la taille de travail est réduite pour tenir dans la mémoire libre : l’image s’affiche dès la lecture, et la pleine résolution signale alors qu’elle ne tient pas.
+À l’ouverture et pendant le déplacement d’un curseur, les grandes images sont traitées en aperçu réduit (grand côté ramené vers 2048 pixels). Le bouton **Raffiner** relance Richardson-Lucy à pleine résolution. Sur une carte peu dotée en mémoire, comme une GTX 1060 de 3 Gio, la taille de travail est plafonnée plus bas (environ 1536 pixels de grand côté) pour éviter un blocage du pilote Windows : l’image s’affiche dès la lecture, et la pleine résolution signale alors qu’elle ne tient pas.
 
 ## Utilisation
 

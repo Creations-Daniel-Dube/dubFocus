@@ -197,7 +197,9 @@ impl App {
         self.refined = false;
         self.texture = None;
         self.status = "Lecture…".to_string();
-        let params = self.snapshot_params(false);
+        // Aperçu d'abord : sur une 1060 3 Gio, la pleine résolution au chargement
+        // poussait cuFFT jusqu'au blocage silencieux du pilote Windows.
+        let params = self.snapshot_params(true);
         let ticket = self.bump();
         self.engine.as_ref().unwrap().open(path, params, ticket);
     }
