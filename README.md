@@ -1,4 +1,4 @@
-# dubFocus
+# dubFocus 2026
 
 > Application du catalogue dubSuite. Installation, mises à jour et désinstallation : [dubSuite](https://github.com/Creations-Daniel-Dube/dubSuite).
 
