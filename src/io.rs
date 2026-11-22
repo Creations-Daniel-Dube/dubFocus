@@ -3,7 +3,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
 use image::{ImageBuffer, ImageReader, Luma, Rgb};
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::encoder::TiffEncoder;
 use tiff::encoder::colortype::{Gray16, Gray32Float, RGB16, RGB32Float};
 use tiff::ColorType;
@@ -118,7 +118,9 @@ fn load_raster(path: &Path) -> Result<ImageData, Error> {
 
 fn load_tiff(path: &Path) -> Result<ImageData, Error> {
     let file = File::open(path).map_err(|err| Error::new(format!("lecture : {err}")))?;
-    let mut decoder = Decoder::new(BufReader::new(file)).map_err(|err| Error::new(format!("tiff : {err}")))?;
+    let mut decoder = Decoder::new(BufReader::new(file))
+        .map_err(|err| Error::new(format!("tiff : {err}")))?
+        .with_limits(Limits::unlimited());
     let (width, height) = decoder.dimensions().map_err(|err| Error::new(format!("tiff : {err}")))?;
     let color = decoder.colortype().map_err(|err| Error::new(format!("tiff : {err}")))?;
     let decoded = decoder.read_image().map_err(|err| Error::new(format!("tiff : {err}")))?;
